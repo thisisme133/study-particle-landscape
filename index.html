@@ -117,6 +117,13 @@
         uHoverStrength: { value: 0.8 },
         uHoverSnap: { value: 2.0 },
         uHoverColor: { value: new THREE.Color(0xffcc55) },
+        uHoverEnabled: { value: 1.0 },
+        // Airplane hover highlight
+        uAirplanePos: { value: new THREE.Vector3(9999, 9999, 9999) },
+        uAirplaneHoverEnabled: { value: 0.0 },
+        uAirplaneHoverRadius: { value: 2.0 },
+        uAirplaneColorFar: { value: new THREE.Color(0x00ffaa) },  // cyan-green when high/safe
+        uAirplaneColorClose: { value: new THREE.Color(0xff0000) }, // pure red when low/danger
         // Fog uniforms expected by renderer when material.fog === true
         fogColor: { value: new THREE.Color(0x0e0f13) },
         fogNear: { value: 1 },
@@ -131,6 +138,8 @@
         #include <uv_pars_vertex>
         varying float vMaskAlpha;
         varying float vHoverMix;
+        varying float vAirplaneMix;
+        varying float vAirplaneProximity;
         #include <fog_pars_vertex>
         uniform sampler2D uMap;
         uniform float uScale;
@@ -145,6 +154,10 @@
         uniform float uHoverRadius;
         uniform float uHoverStrength;
         uniform float uHoverSnap;
+        uniform float uHoverEnabled;
+        uniform vec3 uAirplanePos;
+        uniform float uAirplaneHoverEnabled;
+        uniform float uAirplaneHoverRadius;
         // hash-based 2D noise -> scalar in [-1,1]
         float hash(vec2 p){
           return -1.0 + 2.0 * fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
@@ -175,18 +188,30 @@
           float edge0 = uMaskRadius;
           float edge1 = uMaskRadius + max(0.0001, uMaskFeather);
           vMaskAlpha = 1.0 - smoothstep(edge0, edge1, d);
-          // hover influence factor 0..1 with soft falloff
+          // mouse hover influence factor 0..1 with soft falloff
           float hd = length(worldPos.xz - uHoverCenter);
           float hEdge = uHoverRadius;
-          vHoverMix = 1.0 - smoothstep(hEdge, hEdge + 0.5, hd);
+          vHoverMix = uHoverEnabled * (1.0 - smoothstep(hEdge, hEdge + 0.5, hd));
+          // airplane hover - distance in XZ plane from airplane
+          float airDist = length(worldPos.xz - uAirplanePos.xz);
+          float airEdge = uAirplaneHoverRadius;
+          vAirplaneMix = uAirplaneHoverEnabled * (1.0 - smoothstep(airEdge, airEdge + 0.8, airDist));
+          // proximity factor: how close is the particle to airplane vertically (0=far, 1=close)
+          // Use signed distance - particles ABOVE airplane are far (green), BELOW or at same level are close (red)
+          float vertDist = uAirplanePos.y - worldPos.y; // positive when airplane is above particle
+          vAirplaneProximity = 1.0 - clamp(vertDist / 0.6, 0.0, 1.0); // 0=airplane high above, 1=at or below particle
           #include <fog_vertex>
         }
       `,
       fragmentShader: `
         uniform vec3 uColor;
         uniform vec3 uHoverColor;
+        uniform vec3 uAirplaneColorFar;
+        uniform vec3 uAirplaneColorClose;
         varying float vMaskAlpha;
         varying float vHoverMix;
+        varying float vAirplaneMix;
+        varying float vAirplaneProximity;
         #include <fog_pars_fragment>
         void main() {
           vec2 pc = gl_PointCoord - 0.5;
@@ -194,7 +219,13 @@
           float disc = 1.0 - smoothstep(0.5, 0.55, r);
           float alpha = disc * vMaskAlpha;
           if (alpha <= 0.001) discard;
-          vec3 col = mix(uColor, uHoverColor, vHoverMix);
+          // Start with base color
+          vec3 col = uColor;
+          // Apply mouse hover color
+          col = mix(col, uHoverColor, vHoverMix);
+          // Apply airplane hover - blend between far (orange) and close (red) based on proximity
+          vec3 airplaneColor = mix(uAirplaneColorFar, uAirplaneColorClose, vAirplaneProximity);
+          col = mix(col, airplaneColor, vAirplaneMix);
           gl_FragColor = vec4(col, alpha);
           #include <fog_fragment>
         }
@@ -206,6 +237,270 @@
     
 
     // (Trail system removed)
+
+    // ========== AIRPLANE ==========
+    let airplane = null;
+    let airplaneGroup = null;
+    const airplaneState = {
+      enabled: false,
+      x: 0,          // current X position (world space offset from center)
+      targetX: 0,    // target X position
+      y: 0,          // current Y offset (altitude adjustment)
+      targetY: 0,    // target Y offset
+      tilt: 0,       // current tilt (roll) angle
+      pitch: 0,      // current pitch angle
+      speed: 3,      // horizontal movement speed
+      vertSpeed: 2,  // vertical movement speed
+      maxOffset: 5.5,  // max left/right offset
+      altitudeRange: 1.5, // max up/down range
+      smoothing: 8,  // lerp smoothing factor
+      height: -2.5,  // height offset from camera
+      size: 0.4,     // scale of the airplane
+      distance: 3.5, // distance ahead of camera
+      // Collision state
+      isColliding: false,
+      collisionShake: 0,
+      collisionThreshold: -0.1, // negative = only trigger when actually below terrain
+    };
+    
+    // Store airplane materials for color change on collision
+    let airplaneMaterials = [];
+    const keysPressed = { left: false, right: false, up: false, down: false };
+
+    function createAirplane() {
+      // Create a retro wireframe arrow pointing forward
+      const group = new THREE.Group();
+      
+      // Arrow outline - wireframe style like retro arcade radar
+      // Arrow points forward (+Z direction after 180 flip)
+      const arrowVerts = new Float32Array([
+        // Arrow shape pointing forward (nose at front)
+        0, 0, 0.5,        // nose (front tip)
+        -0.25, 0, -0.3,   // left back corner
+        0, 0, -0.15,      // center notch (back)
+        
+        0, 0, 0.5,        // nose (front tip)
+        0, 0, -0.15,      // center notch (back)
+        0.25, 0, -0.3,    // right back corner
+        
+        // Close the back
+        -0.25, 0, -0.3,   // left back corner
+        0, 0, -0.15,      // center notch
+        0.25, 0, -0.3,    // right back corner
+      ]);
+      
+      const arrowGeo = new THREE.BufferGeometry();
+      arrowGeo.setAttribute('position', new THREE.BufferAttribute(arrowVerts, 3));
+      
+      // Wireframe material - retro arcade look
+      const wireMat = new THREE.MeshBasicMaterial({ 
+        color: 0xffffff,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.9
+      });
+      
+      const arrow = new THREE.Mesh(arrowGeo, wireMat);
+      group.add(arrow);
+      
+      // Store materials for collision color change
+      airplaneMaterials = [wireMat];
+      
+      // Add edge lines for cleaner wireframe look
+      const edgeVerts = new Float32Array([
+        // Outline of the arrow
+        0, 0, 0.5,        // nose
+        -0.25, 0, -0.3,   // left back
+        -0.25, 0, -0.3,   // left back
+        0, 0, -0.15,      // center notch
+        0, 0, -0.15,      // center notch
+        0.25, 0, -0.3,    // right back
+        0.25, 0, -0.3,    // right back
+        0, 0, 0.5,        // back to nose
+      ]);
+      
+      const edgeGeo = new THREE.BufferGeometry();
+      edgeGeo.setAttribute('position', new THREE.BufferAttribute(edgeVerts, 3));
+      
+      const lineMat = new THREE.LineBasicMaterial({ 
+        color: 0xffffff,
+        transparent: true,
+        opacity: 1.0,
+        linewidth: 2
+      });
+      
+      const edges = new THREE.LineSegments(edgeGeo, lineMat);
+      group.add(edges);
+      
+      // Add line material to stored materials
+      airplaneMaterials.push(lineMat);
+      
+      // Scale based on airplaneState.size
+      group.scale.set(airplaneState.size, airplaneState.size, airplaneState.size);
+      
+      return group;
+    }
+
+    function initAirplane() {
+      if (airplaneGroup) {
+        scene.remove(airplaneGroup);
+        airplaneGroup = null;
+      }
+      airplaneGroup = createAirplane();
+      airplaneGroup.visible = airplaneState.enabled;
+      scene.add(airplaneGroup);
+    }
+
+    function updateAirplane(delta) {
+      if (!airplaneGroup || !airplaneState.enabled) return;
+      
+      // Handle horizontal input - update target position
+      if (keysPressed.left) {
+        airplaneState.targetX = Math.max(-airplaneState.maxOffset, airplaneState.targetX - airplaneState.speed * delta);
+      }
+      if (keysPressed.right) {
+        airplaneState.targetX = Math.min(airplaneState.maxOffset, airplaneState.targetX + airplaneState.speed * delta);
+      }
+      
+      // Handle vertical input - update target altitude
+      if (keysPressed.up) {
+        airplaneState.targetY = Math.min(airplaneState.altitudeRange, airplaneState.targetY + airplaneState.vertSpeed * delta);
+      }
+      if (keysPressed.down) {
+        airplaneState.targetY = Math.max(-airplaneState.altitudeRange, airplaneState.targetY - airplaneState.vertSpeed * delta);
+      }
+      
+      // Smooth horizontal movement toward target
+      const dx = airplaneState.targetX - airplaneState.x;
+      airplaneState.x += dx * Math.min(1, airplaneState.smoothing * delta);
+      
+      // Smooth vertical movement toward target
+      const dy = airplaneState.targetY - airplaneState.y;
+      airplaneState.y += dy * Math.min(1, airplaneState.smoothing * delta);
+      
+      // Calculate tilt based on movement direction (bank into turns like real airplane)
+      const targetTilt = dx * 1.25; // reversed tilt, reduced by 50%
+      airplaneState.tilt += (targetTilt - airplaneState.tilt) * Math.min(1, 6 * delta);
+      
+      // Calculate pitch based on vertical movement
+      const targetPitch = -dy * 0.8; // nose up when climbing, down when diving
+      airplaneState.pitch += (targetPitch - airplaneState.pitch) * Math.min(1, 6 * delta);
+      
+      // Position airplane relative to camera
+      // Get camera's forward direction on XZ plane
+      const forward = new THREE.Vector3();
+      camera.getWorldDirection(forward);
+      forward.y = 0;
+      forward.normalize();
+      
+      // Get right vector
+      const right = new THREE.Vector3();
+      right.crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+      
+      // Position airplane in front of and slightly below camera
+      airplaneGroup.position.copy(camera.position);
+      airplaneGroup.position.addScaledVector(forward, airplaneState.distance);
+      airplaneGroup.position.addScaledVector(right, airplaneState.x);
+      airplaneGroup.position.y = camera.position.y + airplaneState.height + airplaneState.y;
+      
+      // Update scale
+      airplaneGroup.scale.set(airplaneState.size, airplaneState.size, airplaneState.size);
+      
+      // Orient airplane to face camera's forward direction with tilt and pitch
+      const lookTarget = airplaneGroup.position.clone().add(forward);
+      airplaneGroup.lookAt(lookTarget);
+      airplaneGroup.rotation.z = airplaneState.tilt;
+      airplaneGroup.rotation.x += airplaneState.pitch;
+      
+      const time = performance.now() * 0.001;
+      
+      // Collision detection - sample actual terrain height at airplane position
+      const terrainHeight = sampleTerrainHeight(airplaneGroup.position.x, airplaneGroup.position.z);
+      
+      const wasColliding = airplaneState.isColliding;
+      if (terrainHeight !== null) {
+        // Compare airplane Y to actual terrain height at this position
+        const clearance = airplaneGroup.position.y - terrainHeight;
+        airplaneState.isColliding = clearance < airplaneState.collisionThreshold;
+      } else {
+        airplaneState.isColliding = false; // No heightmap yet
+      }
+      
+      // Handle collision effects
+      // Get target colors from uniforms (which are synced with params)
+      const dangerColor = pointMaterial.uniforms.uAirplaneColorClose.value;
+      const safeColor = pointMaterial.uniforms.uAirplaneColorFar.value;
+      
+      if (airplaneState.isColliding) {
+        // Increase shake intensity
+        airplaneState.collisionShake = Math.min(airplaneState.collisionShake + delta * 15, 1.0);
+        
+        // Turn airplane to danger color
+        for (const mat of airplaneMaterials) {
+          mat.color.copy(dangerColor);
+        }
+        
+        // Apply shake
+        const shakeIntensity = airplaneState.collisionShake * 0.08;
+        airplaneGroup.position.x += (Math.random() - 0.5) * shakeIntensity;
+        airplaneGroup.position.y += (Math.random() - 0.5) * shakeIntensity;
+        airplaneGroup.position.z += (Math.random() - 0.5) * shakeIntensity;
+        airplaneGroup.rotation.z += (Math.random() - 0.5) * shakeIntensity * 0.5;
+      } else {
+        // Decay shake when not colliding
+        airplaneState.collisionShake = Math.max(airplaneState.collisionShake - delta * 5, 0);
+        
+        // Transition to safe color smoothly
+        for (const mat of airplaneMaterials) {
+          const currentColor = mat.color;
+          currentColor.r += (safeColor.r - currentColor.r) * delta * 5;
+          currentColor.g += (safeColor.g - currentColor.g) * delta * 5;
+          currentColor.b += (safeColor.b - currentColor.b) * delta * 5;
+        }
+        
+        // Add subtle bobbing motion only when not colliding
+        airplaneGroup.position.y += Math.sin(time * 2) * 0.02;
+      }
+    }
+
+    // Keyboard controls for airplane
+    window.addEventListener('keydown', (e) => {
+      if (!airplaneState.enabled) return;
+      if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+        keysPressed.left = true;
+        e.preventDefault();
+      }
+      if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+        keysPressed.right = true;
+        e.preventDefault();
+      }
+      if (e.code === 'ArrowUp' || e.code === 'KeyW') {
+        keysPressed.up = true;
+        e.preventDefault();
+      }
+      if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+        keysPressed.down = true;
+        e.preventDefault();
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+        keysPressed.left = false;
+      }
+      if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+        keysPressed.right = false;
+      }
+      if (e.code === 'ArrowUp' || e.code === 'KeyW') {
+        keysPressed.up = false;
+      }
+      if (e.code === 'ArrowDown' || e.code === 'KeyS') {
+        keysPressed.down = false;
+      }
+    });
+
+    // Initialize airplane
+    initAirplane();
 
     // Tiling with Points
     let tilesPoints = [];
@@ -311,6 +606,21 @@
       fogColor: '#0e0f13',
       fogNear: 12,
       fogFar: 1,
+      // Airplane
+      airplaneEnabled: false,
+      airplaneSpeed: 3,
+      airplaneMaxOffset: 5.5,
+      airplaneVertSpeed: 2,
+      airplaneAltitudeRange: 1.5,
+      airplaneHeight: -2.5,
+      airplaneSize: 0.4,
+      airplaneDistance: 3.5,
+      // Hover highlights
+      mouseHoverEnabled: true,
+      airplaneHoverEnabled: true,
+      airplaneHoverRadius: 2.0,
+      airplaneColorSafe: '#00ffaa',   // cyan-green when high/safe
+      airplaneColorDanger: '#ff0000', // red when low/danger
     };
 
     // Helper functions
@@ -386,6 +696,9 @@
     particlesFolder.addBinding(params, 'hoverColor', { view: 'color', label: 'Hover Color' }).on('change', (ev) => {
       pointMaterial.uniforms.uHoverColor.value.set(ev.value);
     });
+    particlesFolder.addBinding(params, 'mouseHoverEnabled', { label: 'Mouse Hover' }).on('change', (ev) => {
+      pointMaterial.uniforms.uHoverEnabled.value = ev.value ? 1.0 : 0.0;
+    });
     particlesFolder.addBlade({ view: 'separator' });
     particlesFolder.addBinding(params, 'cols', { min: 8, max: 1024, step: 8 }).on('change', (ev) => {
       params.cols = clampPowerOfTwo(ev.value);
@@ -413,6 +726,65 @@
       state.scrollSpeed = ev.value;
     });
     animationFolder.addBinding(params, 'animateScroll', { label: 'Animate' });
+
+    // Airplane folder
+    const airplaneFolder = pane.addFolder({ title: 'Airplane', expanded: true });
+    airplaneFolder.addBinding(params, 'airplaneEnabled', { label: 'Enable Airplane' }).on('change', (ev) => {
+      airplaneState.enabled = ev.value;
+      if (airplaneGroup) airplaneGroup.visible = ev.value;
+      // Reset position when toggled on
+      if (ev.value) {
+        airplaneState.x = 0;
+        airplaneState.targetX = 0;
+        airplaneState.y = 0;
+        airplaneState.targetY = 0;
+        airplaneState.tilt = 0;
+        airplaneState.pitch = 0;
+      }
+    });
+    airplaneFolder.addBinding(params, 'airplaneSpeed', { min: 1, max: 20, step: 0.5, label: 'Move Speed' }).on('change', (ev) => {
+      airplaneState.speed = ev.value;
+    });
+    airplaneFolder.addBinding(params, 'airplaneMaxOffset', { min: 1, max: 15, step: 0.5, label: 'Max Offset' }).on('change', (ev) => {
+      airplaneState.maxOffset = ev.value;
+    });
+    airplaneFolder.addBinding(params, 'airplaneVertSpeed', { min: 0.5, max: 5, step: 0.1, label: 'Vert Speed' }).on('change', (ev) => {
+      airplaneState.vertSpeed = ev.value;
+    });
+    airplaneFolder.addBinding(params, 'airplaneAltitudeRange', { min: 0.5, max: 5, step: 0.1, label: 'Alt Range' }).on('change', (ev) => {
+      airplaneState.altitudeRange = ev.value;
+    });
+    airplaneFolder.addBlade({ view: 'separator' });
+    airplaneFolder.addBinding(params, 'airplaneHeight', { min: -5, max: 1, step: 0.1, label: 'Height' }).on('change', (ev) => {
+      airplaneState.height = ev.value;
+    });
+    airplaneFolder.addBinding(params, 'airplaneSize', { min: 0.2, max: 3, step: 0.1, label: 'Size' }).on('change', (ev) => {
+      airplaneState.size = ev.value;
+    });
+    airplaneFolder.addBinding(params, 'airplaneDistance', { min: 1, max: 10, step: 0.1, label: 'Distance' }).on('change', (ev) => {
+      airplaneState.distance = ev.value;
+    });
+    airplaneFolder.addBlade({ view: 'separator' });
+    airplaneFolder.addBinding(params, 'airplaneHoverEnabled', { label: 'Ground Highlight' }).on('change', (ev) => {
+      pointMaterial.uniforms.uAirplaneHoverEnabled.value = ev.value ? 1.0 : 0.0;
+    });
+    airplaneFolder.addBinding(params, 'airplaneHoverRadius', { min: 0.5, max: 5, step: 0.1, label: 'Highlight Size' }).on('change', (ev) => {
+      pointMaterial.uniforms.uAirplaneHoverRadius.value = ev.value;
+    });
+    airplaneFolder.addBinding(params, 'airplaneColorSafe', { view: 'color', label: 'Safe Color' }).on('change', (ev) => {
+      pointMaterial.uniforms.uAirplaneColorFar.value.set(ev.value);
+    });
+    airplaneFolder.addBinding(params, 'airplaneColorDanger', { view: 'color', label: 'Danger Color' }).on('change', (ev) => {
+      pointMaterial.uniforms.uAirplaneColorClose.value.set(ev.value);
+    });
+    airplaneFolder.addBlade({ view: 'separator' });
+    const airplaneHint = airplaneFolder.addBlade({
+      view: 'text',
+      label: '',
+      parse: (v) => String(v),
+      value: '↑↓←→ or WASD to fly',
+    });
+    airplaneHint.disabled = true;
 
     // Camera folder
     const cameraFolder = pane.addFolder({ title: 'Camera', expanded: true });
@@ -539,6 +911,10 @@
       pointMaterial.uniforms.uHoverStrength.value = params.hoverStrength;
       pointMaterial.uniforms.uHoverSnap.value = params.hoverSnap;
       pointMaterial.uniforms.uHoverColor.value.set(params.hoverColor);
+      pointMaterial.uniforms.uHoverEnabled.value = params.mouseHoverEnabled ? 1.0 : 0.0;
+      // Airplane hover defaults
+      pointMaterial.uniforms.uAirplaneHoverEnabled.value = params.airplaneHoverEnabled ? 1.0 : 0.0;
+      pointMaterial.uniforms.uAirplaneHoverRadius.value = params.airplaneHoverRadius;
       
       // Record defaults for Reset
       defaultCamPos = new THREE.Vector3().copy(camera.position);
@@ -590,6 +966,53 @@
     }
 
     let currentHeightmapTexture = null;
+    let heightmapCanvas = null;
+    let heightmapCtx = null;
+    let heightmapWidth = 0;
+    let heightmapHeight = 0;
+
+    // Sample terrain height at a world XZ position
+    function sampleTerrainHeight(worldX, worldZ) {
+      if (!heightmapCtx || !heightmapWidth || !heightmapHeight) {
+        return null; // No heightmap loaded yet
+      }
+      
+      const tileSize = state.tileSize;
+      
+      // Account for scroll offset - the terrain moves, so we need to sample
+      // relative to the scrolling position
+      const relX = worldX + scrollOffset.x;
+      const relZ = worldZ + scrollOffset.y;
+      
+      // Convert to UV coordinates within [0,1] - the texture repeats per tile
+      // Add 0.5 to center the sampling (geometry goes from -tileSize/2 to +tileSize/2)
+      let u = (((relX / tileSize) + 0.5) % 1 + 1) % 1;
+      let v = (((relZ / tileSize) + 0.5) % 1 + 1) % 1;
+      // Flip V because PlaneGeometry rotation may invert it
+      v = 1.0 - v;
+      
+      // Convert UV to pixel coordinates
+      const px = Math.floor(u * heightmapWidth);
+      const py = Math.floor(v * heightmapHeight);
+      
+      // Clamp to valid range
+      const clampedPx = Math.max(0, Math.min(heightmapWidth - 1, px));
+      const clampedPy = Math.max(0, Math.min(heightmapHeight - 1, py));
+      
+      // Sample the pixel
+      const pixelData = heightmapCtx.getImageData(clampedPx, clampedPy, 1, 1).data;
+      
+      // Calculate height using same formula as shader: (r+g+b)/3 * scale + bias
+      const r = pixelData[0] / 255;
+      const g = pixelData[1] / 255;
+      const b = pixelData[2] / 255;
+      const h = (r + g + b) / 3;
+      
+      const scale = pointMaterial.uniforms.uScale.value;
+      const bias = pointMaterial.uniforms.uBias.value;
+      
+      return h * scale + bias;
+    }
 
     async function applyHeightmapTexture(texture) {
       if (currentHeightmapTexture) {
@@ -619,6 +1042,18 @@
       pointMaterial.uniforms.uBias.value = -pointMaterial.uniforms.uScale.value * 0.5;
       pointMaterial.needsUpdate = true;
       rebuildTiling();
+      
+      // Create canvas for CPU-side heightmap sampling
+      const texImg = texture.image;
+      if (texImg) {
+        heightmapWidth = texImg.width || texImg.naturalWidth || 512;
+        heightmapHeight = texImg.height || texImg.naturalHeight || 512;
+        heightmapCanvas = document.createElement('canvas');
+        heightmapCanvas.width = heightmapWidth;
+        heightmapCanvas.height = heightmapHeight;
+        heightmapCtx = heightmapCanvas.getContext('2d', { willReadFrequently: true });
+        heightmapCtx.drawImage(texImg, 0, 0, heightmapWidth, heightmapHeight);
+      }
     }
 
     fileInput.addEventListener('change', async (e) => {
@@ -694,6 +1129,14 @@
         scrollOffset.x += forward.x * step;
         scrollOffset.y += forward.z * step;
         updateTileMatrices();
+      }
+      // Update airplane
+      updateAirplane(delta);
+      // Update airplane hover position for shader
+      if (airplaneGroup && airplaneState.enabled) {
+        pointMaterial.uniforms.uAirplanePos.value.copy(airplaneGroup.position);
+      } else {
+        pointMaterial.uniforms.uAirplanePos.value.set(9999, 9999, 9999);
       }
       renderer.render(scene, camera);
     }
