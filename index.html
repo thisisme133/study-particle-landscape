@@ -36,7 +36,7 @@
   </style>
 </head>
 <body>
-  <div id="overlayInfo">Drag a heightmap or PLY file onto the canvas. Supports Google 3D Tiles for real-world locations. Project by <a href="https://x.com/taylor_sntx" target="_blank" rel="noopener">Taylor</a></div>
+  <div id="overlayInfo">Drag a heightmap, PLY or LAZ file onto the canvas. Free terrain generation via Open-Elevation API. Project by <a href="https://x.com/taylor_sntx" target="_blank" rel="noopener">Taylor</a></div>
   <input id="heightmapFile" type="file" accept="image/png,image/jpeg,image/webp" style="display:none;">
 
   <script type="importmap">
@@ -44,17 +44,13 @@
       "imports": {
         "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
         "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/",
-        "tweakpane": "https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.js",
-        "3d-tiles-renderer": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.4.19/src/index.js",
-        "3d-tiles-renderer/plugins": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.4.19/src/plugins/index.js"
+        "tweakpane": "https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.js"
       }
     }
   </script>
   <script type="module">
     import * as THREE from 'three';
     import { Pane } from 'tweakpane';
-    import { TilesRenderer, GlobeControls, EnvironmentControls } from '3d-tiles-renderer';
-    import { GoogleCloudAuthPlugin, GLTFExtensionsPlugin, TileCompressionPlugin, UpdateOnChangePlugin, UnloadTilesPlugin } from '3d-tiles-renderer/plugins';
 
     const DEFAULT_HEIGHTMAP_URL = 'assets/heightmap_512x512.png';
     // Track mouse for hover effects
@@ -507,195 +503,12 @@
     // Initialize airplane
     initAirplane();
 
-    // ========== GOOGLE 3D TILES / POINT CLOUD ==========
-    let tilesRenderer = null;
-    let tilesGroup = null;
-    let pointCloudMode = 'heightmap'; // 'heightmap' | 'google3d' | 'ply'
+    // ========== POINT CLOUD SYSTEM (FREE & OPEN SOURCE) ==========
+    let pointCloudMode = 'heightmap'; // 'heightmap' | 'elevation' | 'ply' | 'laz'
     let extractedPointCloud = null;
 
-    const tiles3DState = {
-      enabled: false,
-      apiKey: '',
-      latitude: 48.8584,  // Paris - Eiffel Tower
-      longitude: 2.2945,
-      altitude: 300,
-      pointDensity: 1.0,  // 1.0 = use all vertices, 0.1 = use 10%
-      sceneScale: 0.001,  // Scale factor from meters to scene units
-      showMesh: false,    // Show original mesh alongside point cloud
-    };
-
-    // Preset locations for quick testing
-    const presetLocations = {
-      'Paris - Tour Eiffel': { lat: 48.8584, lon: 2.2945, alt: 300 },
-      'New York - Manhattan': { lat: 40.7484, lon: -73.9857, alt: 400 },
-      'San Francisco': { lat: 37.7749, lon: -122.4194, alt: 300 },
-      'Tokyo - Shibuya': { lat: 35.6595, lon: 139.7004, alt: 250 },
-      'London - Big Ben': { lat: 51.5007, lon: -0.1246, alt: 200 },
-      'Sydney Opera House': { lat: -33.8568, lon: 151.2153, alt: 200 },
-      'Dubai - Burj Khalifa': { lat: 25.1972, lon: 55.2744, alt: 500 },
-    };
-
-    // WGS84 ellipsoid parameters
-    const WGS84_A = 6378137.0;  // semi-major axis
-    const WGS84_B = 6356752.314245;  // semi-minor axis
-
-    // Convert lat/lon/alt to ECEF (Earth-Centered, Earth-Fixed)
-    function latLonToECEF(lat, lon, alt) {
-      const latRad = lat * Math.PI / 180;
-      const lonRad = lon * Math.PI / 180;
-      const e2 = 1 - (WGS84_B * WGS84_B) / (WGS84_A * WGS84_A);
-      const N = WGS84_A / Math.sqrt(1 - e2 * Math.sin(latRad) * Math.sin(latRad));
-      const x = (N + alt) * Math.cos(latRad) * Math.cos(lonRad);
-      const y = (N + alt) * Math.cos(latRad) * Math.sin(lonRad);
-      const z = (N * (1 - e2) + alt) * Math.sin(latRad);
-      return new THREE.Vector3(x, y, z);
-    }
-
-    // Get the ENU (East-North-Up) rotation matrix for a lat/lon position
-    function getENURotation(lat, lon) {
-      const latRad = lat * Math.PI / 180;
-      const lonRad = lon * Math.PI / 180;
-      // Create rotation matrix for ENU coordinate system
-      const m = new THREE.Matrix4();
-      m.set(
-        -Math.sin(lonRad), -Math.sin(latRad) * Math.cos(lonRad), Math.cos(latRad) * Math.cos(lonRad), 0,
-        Math.cos(lonRad), -Math.sin(latRad) * Math.sin(lonRad), Math.cos(latRad) * Math.sin(lonRad), 0,
-        0, Math.cos(latRad), Math.sin(latRad), 0,
-        0, 0, 0, 1
-      );
-      return m;
-    }
-
-    async function initGoogleTiles() {
-      if (!tiles3DState.apiKey) {
-        console.warn('Google 3D Tiles: API key required');
-        return;
-      }
-
-      // Clean up existing tiles
-      if (tilesRenderer) {
-        tilesRenderer.dispose();
-        tilesRenderer = null;
-      }
-      if (tilesGroup) {
-        scene.remove(tilesGroup);
-        tilesGroup = null;
-      }
-
-      try {
-        tilesGroup = new THREE.Group();
-        scene.add(tilesGroup);
-
-        tilesRenderer = new TilesRenderer();
-
-        // Register plugins
-        tilesRenderer.registerPlugin(new GoogleCloudAuthPlugin({
-          apiToken: tiles3DState.apiKey,
-          autoRefreshToken: true
-        }));
-        tilesRenderer.registerPlugin(new GLTFExtensionsPlugin());
-        tilesRenderer.registerPlugin(new TileCompressionPlugin());
-        tilesRenderer.registerPlugin(new UpdateOnChangePlugin());
-
-        // Configure renderer
-        tilesRenderer.setCamera(camera);
-        tilesRenderer.setResolutionFromRenderer(camera, renderer);
-
-        // Add to scene group
-        tilesGroup.add(tilesRenderer.group);
-
-        // Position camera based on lat/lon
-        updateTilesPosition();
-
-        console.log('Google 3D Tiles initialized');
-        tiles3DState.enabled = true;
-
-      } catch (err) {
-        console.error('Failed to initialize Google 3D Tiles:', err);
-        tiles3DState.enabled = false;
-      }
-    }
-
-    function updateTilesPosition() {
-      if (!tilesRenderer || !tilesGroup) return;
-
-      const ecefPos = latLonToECEF(tiles3DState.latitude, tiles3DState.longitude, tiles3DState.altitude);
-      const enuRotation = getENURotation(tiles3DState.latitude, tiles3DState.longitude);
-
-      // Scale and position the tiles group
-      const scale = tiles3DState.sceneScale;
-      tilesGroup.scale.set(scale, scale, scale);
-
-      // Calculate the offset so the target location is at origin
-      tilesGroup.position.set(
-        -ecefPos.x * scale,
-        -ecefPos.z * scale,  // Swap Y/Z for Three.js coordinate system
-        -ecefPos.y * scale
-      );
-
-      // Apply ENU rotation so "up" is correct
-      tilesGroup.setRotationFromMatrix(enuRotation);
-    }
-
-    // Extract point cloud from loaded 3D Tiles meshes
-    function extractPointCloudFromTiles() {
-      if (!tilesRenderer) return null;
-
-      const positions = [];
-      const colors = [];
-      const density = tiles3DState.pointDensity;
-
-      // Traverse all loaded tiles and extract vertices
-      tilesRenderer.group.traverse((child) => {
-        if (child.isMesh && child.geometry) {
-          const geo = child.geometry;
-          const posAttr = geo.getAttribute('position');
-          const colorAttr = geo.getAttribute('color');
-          const normalAttr = geo.getAttribute('normal');
-
-          if (!posAttr) return;
-
-          // Get world matrix for this mesh
-          const worldMatrix = child.matrixWorld;
-          const tempVec = new THREE.Vector3();
-          const tempColor = new THREE.Color();
-
-          // Sample vertices based on density
-          const step = Math.max(1, Math.floor(1 / density));
-          for (let i = 0; i < posAttr.count; i += step) {
-            // Get position in world space
-            tempVec.fromBufferAttribute(posAttr, i);
-            tempVec.applyMatrix4(worldMatrix);
-
-            // Apply scene scale
-            tempVec.multiplyScalar(tiles3DState.sceneScale);
-
-            positions.push(tempVec.x, tempVec.y, tempVec.z);
-
-            // Get color if available, otherwise use white
-            if (colorAttr) {
-              tempColor.fromBufferAttribute(colorAttr, i);
-              colors.push(tempColor.r, tempColor.g, tempColor.b);
-            } else {
-              colors.push(1, 1, 1);
-            }
-          }
-        }
-      });
-
-      if (positions.length === 0) return null;
-
-      // Create point cloud geometry
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-      geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-      geometry.computeBoundingSphere();
-
-      return geometry;
-    }
-
-    // Create point cloud material for extracted tiles
-    const tilesPointMaterial = new THREE.PointsMaterial({
+    // Create point cloud material for loaded data
+    const loadedPointMaterial = new THREE.PointsMaterial({
       size: 0.02,
       vertexColors: true,
       transparent: true,
@@ -703,39 +516,148 @@
       sizeAttenuation: true,
     });
 
-    function updateExtractedPointCloud() {
-      if (extractedPointCloud) {
-        scene.remove(extractedPointCloud);
-        if (extractedPointCloud.geometry) extractedPointCloud.geometry.dispose();
-        extractedPointCloud = null;
+    // State for terrain generation
+    const terrainState = {
+      latitude: 45.8326,   // Mont Blanc area (free elevation data available)
+      longitude: 6.8652,
+      gridSize: 50,        // Grid points per side
+      areaSize: 0.05,      // Area in degrees (~5km)
+      heightScale: 0.001,  // Scale elevation to scene units
+      isLoading: false,
+    };
+
+    // Preset locations with good free elevation data
+    const presetLocations = {
+      'Mont Blanc (Alps)': { lat: 45.8326, lon: 6.8652, area: 0.05 },
+      'Grand Canyon': { lat: 36.1069, lon: -112.1129, area: 0.08 },
+      'Mount Fuji': { lat: 35.3606, lon: 138.7274, area: 0.06 },
+      'Yosemite Valley': { lat: 37.7456, lon: -119.5936, area: 0.04 },
+      'Swiss Alps (Matterhorn)': { lat: 45.9766, lon: 7.6585, area: 0.05 },
+      'Norwegian Fjords': { lat: 62.1167, lon: 6.7500, area: 0.06 },
+      'Himalaya (Everest region)': { lat: 27.9881, lon: 86.9250, area: 0.08 },
+    };
+
+    // Links to free LiDAR datasets
+    const freeLiDARDatasets = {
+      'USGS 3DEP (USA)': 'https://apps.nationalmap.gov/lidar-explorer/',
+      'AHN Netherlands': 'https://www.ahn.nl/ahn-viewer',
+      'UK Environment Agency': 'https://environment.data.gov.uk/DefraDataDownload/?Mode=survey',
+      'OpenTopography': 'https://portal.opentopography.org/dataCatalog',
+      'Spain PNOA': 'https://centrodedescargas.cnig.es/CentroDescargas/',
+    };
+
+    // ========== OPEN-ELEVATION API (FREE, NO KEY) ==========
+    async function generateTerrainFromElevation() {
+      if (terrainState.isLoading) return;
+      terrainState.isLoading = true;
+
+      const { latitude, longitude, gridSize, areaSize, heightScale } = terrainState;
+      const halfArea = areaSize / 2;
+
+      // Generate grid of lat/lon points
+      const locations = [];
+      for (let z = 0; z < gridSize; z++) {
+        for (let x = 0; x < gridSize; x++) {
+          const lat = latitude - halfArea + (z / (gridSize - 1)) * areaSize;
+          const lon = longitude - halfArea + (x / (gridSize - 1)) * areaSize;
+          locations.push({ latitude: lat, longitude: lon });
+        }
       }
 
-      if (!tiles3DState.enabled || !tilesRenderer) return;
+      try {
+        // Open-Elevation API - free, no key required
+        // Limit: batch requests in chunks of 100
+        const chunkSize = 100;
+        const elevations = [];
 
-      const geometry = extractPointCloudFromTiles();
-      if (geometry) {
-        extractedPointCloud = new THREE.Points(geometry, tilesPointMaterial);
+        for (let i = 0; i < locations.length; i += chunkSize) {
+          const chunk = locations.slice(i, i + chunkSize);
+          const response = await fetch('https://api.open-elevation.com/api/v1/lookup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ locations: chunk })
+          });
+
+          if (!response.ok) throw new Error(`API error: ${response.status}`);
+
+          const data = await response.json();
+          elevations.push(...data.results.map(r => r.elevation));
+
+          // Rate limiting
+          if (i + chunkSize < locations.length) {
+            await new Promise(r => setTimeout(r, 1100)); // 1 request/second limit
+          }
+        }
+
+        // Create point cloud from elevation data
+        const positions = [];
+        const colors = [];
+        let minElev = Infinity, maxElev = -Infinity;
+
+        // Find elevation range for coloring
+        for (const e of elevations) {
+          if (e < minElev) minElev = e;
+          if (e > maxElev) maxElev = e;
+        }
+        const elevRange = maxElev - minElev || 1;
+
+        // Generate points
+        const sceneSize = 10; // Scene units
+        for (let z = 0; z < gridSize; z++) {
+          for (let x = 0; x < gridSize; x++) {
+            const idx = z * gridSize + x;
+            const elev = elevations[idx];
+
+            // Position in scene
+            const px = (x / (gridSize - 1) - 0.5) * sceneSize;
+            const pz = (z / (gridSize - 1) - 0.5) * sceneSize;
+            const py = (elev - minElev) * heightScale;
+
+            positions.push(px, py, pz);
+
+            // Color based on elevation (green low, brown mid, white high)
+            const t = (elev - minElev) / elevRange;
+            if (t < 0.3) {
+              colors.push(0.2 + t, 0.5 + t * 0.5, 0.2);
+            } else if (t < 0.7) {
+              colors.push(0.5 + (t - 0.3) * 0.5, 0.4 + (t - 0.3) * 0.3, 0.2);
+            } else {
+              colors.push(0.8 + (t - 0.7) * 0.6, 0.8 + (t - 0.7) * 0.6, 0.8 + (t - 0.7) * 0.6);
+            }
+          }
+        }
+
+        // Create geometry
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+        geometry.computeBoundingSphere();
+
+        // Clear existing and add new
+        disposePointCloud();
+        extractedPointCloud = new THREE.Points(geometry, loadedPointMaterial);
         extractedPointCloud.frustumCulled = false;
         scene.add(extractedPointCloud);
-        console.log('Point cloud extracted:', geometry.getAttribute('position').count, 'points');
+
+        // Hide heightmap tiles
+        for (const p of tilesPoints) p.visible = false;
+
+        console.log(`Terrain generated: ${positions.length / 3} points, elevation ${minElev.toFixed(0)}m - ${maxElev.toFixed(0)}m`);
+
+      } catch (err) {
+        console.error('Failed to fetch elevation data:', err);
+        alert('Erreur lors du chargement des données d\'élévation: ' + err.message);
+      } finally {
+        terrainState.isLoading = false;
       }
     }
 
-    function disposeTiles() {
+    function disposePointCloud() {
       if (extractedPointCloud) {
         scene.remove(extractedPointCloud);
         if (extractedPointCloud.geometry) extractedPointCloud.geometry.dispose();
         extractedPointCloud = null;
       }
-      if (tilesRenderer) {
-        tilesRenderer.dispose();
-        tilesRenderer = null;
-      }
-      if (tilesGroup) {
-        scene.remove(tilesGroup);
-        tilesGroup = null;
-      }
-      tiles3DState.enabled = false;
     }
 
     // ========== PLY POINT CLOUD LOADER ==========
@@ -797,6 +719,92 @@
       const size = geometry.boundingBox.getSize(new THREE.Vector3());
       const maxDim = Math.max(size.x, size.y, size.z);
       const scale = 10 / maxDim;  // Fit in ~10 unit box
+      geometry.scale(scale, scale, scale);
+
+      return geometry;
+    }
+
+    // ========== LAS FILE LOADER (Uncompressed LiDAR) ==========
+    async function loadLASFile(file) {
+      const buffer = await file.arrayBuffer();
+      const view = new DataView(buffer);
+
+      // Check signature "LASF"
+      const signature = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+      if (signature !== 'LASF') {
+        throw new Error('Invalid LAS file (signature mismatch)');
+      }
+
+      // Read header
+      const versionMajor = view.getUint8(24);
+      const versionMinor = view.getUint8(25);
+      const headerSize = view.getUint16(94, true);
+      const offsetToPoints = view.getUint32(96, true);
+      const pointFormat = view.getUint8(104);
+      const pointRecordLength = view.getUint16(105, true);
+      const numPoints = view.getUint32(107, true);
+
+      // Scale and offset for coordinates
+      const scaleX = view.getFloat64(131, true);
+      const scaleY = view.getFloat64(139, true);
+      const scaleZ = view.getFloat64(147, true);
+      const offsetX = view.getFloat64(155, true);
+      const offsetY = view.getFloat64(163, true);
+      const offsetZ = view.getFloat64(171, true);
+
+      console.log(`LAS ${versionMajor}.${versionMinor}, Format ${pointFormat}, ${numPoints} points`);
+
+      const positions = [];
+      const colors = [];
+      const hasRGB = pointFormat === 2 || pointFormat === 3 || pointFormat === 5 || pointFormat === 7;
+
+      // Read points (limit for performance)
+      const maxPoints = Math.min(numPoints, 2000000);
+      const step = Math.max(1, Math.floor(numPoints / maxPoints));
+
+      for (let i = 0; i < numPoints; i += step) {
+        const offset = offsetToPoints + i * pointRecordLength;
+        if (offset + 20 > buffer.byteLength) break;
+
+        // Read XYZ as int32
+        const xi = view.getInt32(offset, true);
+        const yi = view.getInt32(offset + 4, true);
+        const zi = view.getInt32(offset + 8, true);
+
+        const x = xi * scaleX + offsetX;
+        const y = yi * scaleY + offsetY;
+        const z = zi * scaleZ + offsetZ;
+
+        positions.push(x, z, -y); // Swap Y/Z for Three.js
+
+        // Read RGB if available
+        if (hasRGB && offset + 28 <= buffer.byteLength) {
+          const rgbOffset = pointFormat === 2 ? 20 : 28;
+          const r = view.getUint16(offset + rgbOffset, true) / 65535;
+          const g = view.getUint16(offset + rgbOffset + 2, true) / 65535;
+          const b = view.getUint16(offset + rgbOffset + 4, true) / 65535;
+          colors.push(r, g, b);
+        } else {
+          // Use intensity for grayscale
+          const intensity = view.getUint16(offset + 12, true) / 65535;
+          colors.push(intensity, intensity, intensity);
+        }
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      geometry.computeBoundingSphere();
+      geometry.computeBoundingBox();
+
+      // Center and scale
+      const center = new THREE.Vector3();
+      geometry.boundingBox.getCenter(center);
+      geometry.translate(-center.x, -center.y, -center.z);
+
+      const size = geometry.boundingBox.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const scale = 10 / maxDim;
       geometry.scale(scale, scale, scale);
 
       return geometry;
@@ -954,79 +962,70 @@
     const sourceFolder = pane.addFolder({ title: 'Point Cloud Source', expanded: true });
     const sourceParams = {
       mode: 'heightmap',
-      presetLocation: 'Paris - Tour Eiffel',
+      presetLocation: 'Mont Blanc (Alps)',
     };
 
     sourceFolder.addBinding(sourceParams, 'mode', {
       label: 'Source',
       options: {
         'Heightmap': 'heightmap',
-        'Google 3D Tiles': 'google3d',
+        'Free Elevation API': 'elevation',
         'PLY File': 'ply',
+        'LAS File': 'las',
       }
     }).on('change', (ev) => {
       pointCloudMode = ev.value;
       updateSourceVisibility();
     });
 
-    // Google 3D Tiles subfolder
-    const google3DFolder = sourceFolder.addFolder({ title: 'Google 3D Tiles', expanded: true });
+    // Free Elevation API subfolder (Open-Elevation - 100% gratuit)
+    const elevationFolder = sourceFolder.addFolder({ title: 'Free Elevation API', expanded: true });
 
-    google3DFolder.addBinding(tiles3DState, 'apiKey', { label: 'API Key' });
-
-    google3DFolder.addBinding(sourceParams, 'presetLocation', {
+    elevationFolder.addBinding(sourceParams, 'presetLocation', {
       label: 'Preset',
       options: Object.fromEntries(Object.keys(presetLocations).map(k => [k, k]))
     }).on('change', (ev) => {
       const loc = presetLocations[ev.value];
       if (loc) {
-        tiles3DState.latitude = loc.lat;
-        tiles3DState.longitude = loc.lon;
-        tiles3DState.altitude = loc.alt;
+        terrainState.latitude = loc.lat;
+        terrainState.longitude = loc.lon;
+        terrainState.areaSize = loc.area;
         pane.refresh();
-        if (tiles3DState.enabled) updateTilesPosition();
       }
     });
 
-    google3DFolder.addBinding(tiles3DState, 'latitude', { label: 'Latitude', min: -90, max: 90, step: 0.0001 }).on('change', () => {
-      if (tiles3DState.enabled) updateTilesPosition();
-    });
-    google3DFolder.addBinding(tiles3DState, 'longitude', { label: 'Longitude', min: -180, max: 180, step: 0.0001 }).on('change', () => {
-      if (tiles3DState.enabled) updateTilesPosition();
-    });
-    google3DFolder.addBinding(tiles3DState, 'altitude', { label: 'Altitude (m)', min: 50, max: 2000, step: 10 }).on('change', () => {
-      if (tiles3DState.enabled) updateTilesPosition();
-    });
+    elevationFolder.addBinding(terrainState, 'latitude', { label: 'Latitude', min: -90, max: 90, step: 0.0001 });
+    elevationFolder.addBinding(terrainState, 'longitude', { label: 'Longitude', min: -180, max: 180, step: 0.0001 });
+    elevationFolder.addBinding(terrainState, 'areaSize', { label: 'Zone (deg)', min: 0.01, max: 0.2, step: 0.01 });
+    elevationFolder.addBinding(terrainState, 'gridSize', { label: 'Resolution', min: 20, max: 100, step: 10 });
+    elevationFolder.addBinding(terrainState, 'heightScale', { label: 'Height Scale', min: 0.0001, max: 0.01, step: 0.0001 });
 
-    google3DFolder.addBlade({ view: 'separator' });
+    elevationFolder.addBlade({ view: 'separator' });
 
-    google3DFolder.addBinding(tiles3DState, 'pointDensity', { label: 'Point Density', min: 0.01, max: 1, step: 0.01 });
-    google3DFolder.addBinding(tiles3DState, 'sceneScale', { label: 'Scene Scale', min: 0.0001, max: 0.01, step: 0.0001 });
-    google3DFolder.addBinding(tiles3DState, 'showMesh', { label: 'Show Mesh' }).on('change', (ev) => {
-      if (tilesGroup) tilesGroup.visible = ev.value;
-    });
-
-    google3DFolder.addBlade({ view: 'separator' });
-
-    google3DFolder.addButton({ title: 'Load Google 3D Tiles' }).on('click', async () => {
-      if (!tiles3DState.apiKey) {
-        alert('Please enter a Google Maps API key first.\n\nGet one at: https://console.cloud.google.com/apis/library/tile.googleapis.com');
+    elevationFolder.addButton({ title: 'Generate Terrain (Free API)' }).on('click', async () => {
+      if (terrainState.isLoading) {
+        alert('Loading in progress...');
         return;
       }
-      // Hide heightmap tiles
-      for (const p of tilesPoints) p.visible = false;
-      await initGoogleTiles();
+      await generateTerrainFromElevation();
     });
 
-    google3DFolder.addButton({ title: 'Extract Point Cloud' }).on('click', () => {
-      updateExtractedPointCloud();
-    });
-
-    google3DFolder.addButton({ title: 'Disable & Clear' }).on('click', () => {
-      disposeTiles();
-      // Show heightmap tiles again
+    elevationFolder.addButton({ title: 'Clear & Show Heightmap' }).on('click', () => {
+      disposePointCloud();
       for (const p of tilesPoints) p.visible = true;
+      pointCloudMode = 'heightmap';
+      sourceParams.mode = 'heightmap';
+      pane.refresh();
     });
+
+    // Free LiDAR datasets info
+    const datasetsFolder = sourceFolder.addFolder({ title: 'Free LiDAR Datasets', expanded: false });
+
+    for (const [name, url] of Object.entries(freeLiDARDatasets)) {
+      datasetsFolder.addButton({ title: name }).on('click', () => {
+        window.open(url, '_blank');
+      });
+    }
 
     // PLY file loader
     const plyFolder = sourceFolder.addFolder({ title: 'PLY File', expanded: false });
@@ -1046,18 +1045,9 @@
 
       try {
         const geometry = await loadPLYFile(file);
-
-        // Clear existing point cloud
-        if (extractedPointCloud) {
-          scene.remove(extractedPointCloud);
-          if (extractedPointCloud.geometry) extractedPointCloud.geometry.dispose();
-        }
-
-        // Hide heightmap tiles
+        disposePointCloud();
         for (const p of tilesPoints) p.visible = false;
-
-        // Create point cloud from PLY
-        extractedPointCloud = new THREE.Points(geometry, tilesPointMaterial);
+        extractedPointCloud = new THREE.Points(geometry, loadedPointMaterial);
         extractedPointCloud.frustumCulled = false;
         scene.add(extractedPointCloud);
 
@@ -1068,19 +1058,51 @@
       }
     });
 
+    // LAS file loader
+    const lasFolder = sourceFolder.addFolder({ title: 'LAS File (LiDAR)', expanded: false });
+    const lasFileInput = document.createElement('input');
+    lasFileInput.type = 'file';
+    lasFileInput.accept = '.las';
+    lasFileInput.style.display = 'none';
+    document.body.appendChild(lasFileInput);
+
+    lasFolder.addButton({ title: 'Load LAS File...' }).on('click', () => {
+      lasFileInput.click();
+    });
+
+    lasFileInput.addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+
+      try {
+        const geometry = await loadLASFile(file);
+        disposePointCloud();
+        for (const p of tilesPoints) p.visible = false;
+        extractedPointCloud = new THREE.Points(geometry, loadedPointMaterial);
+        extractedPointCloud.frustumCulled = false;
+        scene.add(extractedPointCloud);
+
+        console.log('LAS loaded:', geometry.getAttribute('position').count, 'points');
+      } catch (err) {
+        console.error('Failed to load LAS file:', err);
+        alert('Erreur LAS: ' + err.message + '\n\nNote: Seuls les fichiers LAS non compressés sont supportés. Pour les fichiers LAZ (compressés), utilisez un outil comme PDAL ou CloudCompare pour les convertir en LAS.');
+      }
+    });
+
     function updateSourceVisibility() {
-      google3DFolder.hidden = pointCloudMode !== 'google3d';
+      elevationFolder.hidden = pointCloudMode !== 'elevation';
       plyFolder.hidden = pointCloudMode !== 'ply';
+      lasFolder.hidden = pointCloudMode !== 'las';
+      datasetsFolder.hidden = pointCloudMode !== 'ply' && pointCloudMode !== 'las';
 
       if (pointCloudMode === 'heightmap') {
         // Show heightmap tiles, hide extracted point cloud
         for (const p of tilesPoints) p.visible = true;
         if (extractedPointCloud) extractedPointCloud.visible = false;
-        disposeTiles();
-      } else if (pointCloudMode === 'google3d') {
-        // Will show when loaded
-      } else if (pointCloudMode === 'ply') {
-        // PLY mode - hide heightmap
+      } else if (pointCloudMode === 'elevation') {
+        // Will show when generated
+      } else if (pointCloudMode === 'ply' || pointCloudMode === 'las') {
+        // File mode - hide heightmap
         for (const p of tilesPoints) p.visible = false;
         if (extractedPointCloud) extractedPointCloud.visible = true;
       }
@@ -1512,27 +1534,18 @@
 
     async function handleDropFile(file) {
       if (!file) return;
+      const fileName = file.name.toLowerCase();
 
       // Handle PLY files
-      if (file.name.toLowerCase().endsWith('.ply')) {
+      if (fileName.endsWith('.ply')) {
         try {
           const geometry = await loadPLYFile(file);
-
-          // Clear existing point cloud
-          if (extractedPointCloud) {
-            scene.remove(extractedPointCloud);
-            if (extractedPointCloud.geometry) extractedPointCloud.geometry.dispose();
-          }
-
-          // Hide heightmap tiles
+          disposePointCloud();
           for (const p of tilesPoints) p.visible = false;
-
-          // Create point cloud from PLY
-          extractedPointCloud = new THREE.Points(geometry, tilesPointMaterial);
+          extractedPointCloud = new THREE.Points(geometry, loadedPointMaterial);
           extractedPointCloud.frustumCulled = false;
           scene.add(extractedPointCloud);
 
-          // Update mode selection
           pointCloudMode = 'ply';
           sourceParams.mode = 'ply';
           pane.refresh();
@@ -1541,6 +1554,30 @@
           console.log('PLY loaded via drop:', geometry.getAttribute('position').count, 'points');
         } catch (err) {
           console.error('Failed to load PLY file:', err);
+          alert('Erreur PLY: ' + err.message);
+        }
+        return;
+      }
+
+      // Handle LAS files
+      if (fileName.endsWith('.las')) {
+        try {
+          const geometry = await loadLASFile(file);
+          disposePointCloud();
+          for (const p of tilesPoints) p.visible = false;
+          extractedPointCloud = new THREE.Points(geometry, loadedPointMaterial);
+          extractedPointCloud.frustumCulled = false;
+          scene.add(extractedPointCloud);
+
+          pointCloudMode = 'las';
+          sourceParams.mode = 'las';
+          pane.refresh();
+          updateSourceVisibility();
+
+          console.log('LAS loaded via drop:', geometry.getAttribute('position').count, 'points');
+        } catch (err) {
+          console.error('Failed to load LAS file:', err);
+          alert('Erreur LAS: ' + err.message + '\n\nNote: Seuls les fichiers LAS non compressés sont supportés.');
         }
         return;
       }
@@ -1550,7 +1587,6 @@
       try {
         const texture = await createTextureFromFile(file);
         await applyHeightmapTexture(texture);
-        // Switch back to heightmap mode
         pointCloudMode = 'heightmap';
         sourceParams.mode = 'heightmap';
         pane.refresh();
@@ -1621,10 +1657,6 @@
         pointMaterial.uniforms.uAirplanePos.value.copy(airplaneGroup.position);
       } else {
         pointMaterial.uniforms.uAirplanePos.value.set(9999, 9999, 9999);
-      }
-      // Update 3D Tiles renderer
-      if (tilesRenderer && tiles3DState.enabled) {
-        tilesRenderer.update();
       }
       renderer.render(scene, camera);
     }
