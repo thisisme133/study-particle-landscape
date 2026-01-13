@@ -44,13 +44,20 @@
       "imports": {
         "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
         "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/",
-        "tweakpane": "https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.js"
+        "tweakpane": "https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.js",
+        "@loaders.gl/core": "https://cdn.jsdelivr.net/npm/@loaders.gl/core@4.3.4/dist/index.js",
+        "@loaders.gl/las": "https://cdn.jsdelivr.net/npm/@loaders.gl/las@4.3.4/dist/index.js",
+        "@loaders.gl/schema": "https://cdn.jsdelivr.net/npm/@loaders.gl/schema@4.3.4/dist/index.js",
+        "@loaders.gl/loader-utils": "https://cdn.jsdelivr.net/npm/@loaders.gl/loader-utils@4.3.4/dist/index.js",
+        "@loaders.gl/worker-utils": "https://cdn.jsdelivr.net/npm/@loaders.gl/worker-utils@4.3.4/dist/index.js"
       }
     }
   </script>
   <script type="module">
     import * as THREE from 'three';
     import { Pane } from 'tweakpane';
+    import { load } from '@loaders.gl/core';
+    import { LASLoader } from '@loaders.gl/las';
 
     const DEFAULT_HEIGHTMAP_URL = 'assets/heightmap_512x512.png';
     // Track mouse for hover effects
@@ -504,7 +511,7 @@
     initAirplane();
 
     // ========== POINT CLOUD SYSTEM (FREE & OPEN SOURCE) ==========
-    let pointCloudMode = 'heightmap'; // 'heightmap' | 'elevation' | 'ply' | 'laz'
+    let pointCloudMode = 'heightmap'; // 'heightmap' | 'elevation' | 'ply' | 'las' (LAS/LAZ)
     let extractedPointCloud = null;
 
     // Create point cloud material for loaded data
@@ -810,6 +817,85 @@
       return geometry;
     }
 
+    function buildLidarGeometry(positions, colors, intensities) {
+      const pointCount = Math.floor(positions.length / 3);
+      const maxPoints = 2000000;
+      const step = Math.max(1, Math.floor(pointCount / maxPoints));
+      const sampledCount = Math.ceil(pointCount / step);
+
+      const sampledPositions = new Float32Array(sampledCount * 3);
+      const sampledColors = new Float32Array(sampledCount * 3);
+      const hasColors = colors && colors.length >= pointCount * 4;
+      const hasIntensity = !hasColors && intensities && intensities.length >= pointCount;
+
+      let writeIndex = 0;
+      for (let i = 0; i < pointCount; i += step) {
+        const base = i * 3;
+        const x = positions[base];
+        const y = positions[base + 1];
+        const z = positions[base + 2];
+        sampledPositions[writeIndex * 3] = x;
+        sampledPositions[writeIndex * 3 + 1] = z;
+        sampledPositions[writeIndex * 3 + 2] = -y;
+
+        if (hasColors) {
+          const colorBase = i * 4;
+          sampledColors[writeIndex * 3] = colors[colorBase] / 255;
+          sampledColors[writeIndex * 3 + 1] = colors[colorBase + 1] / 255;
+          sampledColors[writeIndex * 3 + 2] = colors[colorBase + 2] / 255;
+        } else if (hasIntensity) {
+          const intensity = intensities[i] / 65535;
+          sampledColors[writeIndex * 3] = intensity;
+          sampledColors[writeIndex * 3 + 1] = intensity;
+          sampledColors[writeIndex * 3 + 2] = intensity;
+        } else {
+          sampledColors[writeIndex * 3] = 0.8;
+          sampledColors[writeIndex * 3 + 1] = 0.8;
+          sampledColors[writeIndex * 3 + 2] = 0.8;
+        }
+
+        writeIndex += 1;
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(sampledPositions, 3));
+      geometry.setAttribute('color', new THREE.Float32BufferAttribute(sampledColors, 3));
+      geometry.computeBoundingSphere();
+      geometry.computeBoundingBox();
+
+      // Center and scale
+      const center = new THREE.Vector3();
+      geometry.boundingBox.getCenter(center);
+      geometry.translate(-center.x, -center.y, -center.z);
+
+      const size = geometry.boundingBox.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z) || 1;
+      const scale = 10 / maxDim;
+      geometry.scale(scale, scale, scale);
+
+      return geometry;
+    }
+
+    async function loadLAZFile(file) {
+      const buffer = await file.arrayBuffer();
+      const lasMesh = await load(buffer, LASLoader);
+      const positions = lasMesh?.attributes?.POSITION?.value;
+      if (!positions) {
+        throw new Error('No point positions found in LAZ file.');
+      }
+      const colors = lasMesh?.attributes?.COLOR_0?.value;
+      const intensities = lasMesh?.attributes?.intensity?.value;
+      return buildLidarGeometry(positions, colors, intensities);
+    }
+
+    async function loadLidarFile(file) {
+      const fileName = file.name.toLowerCase();
+      if (fileName.endsWith('.laz')) {
+        return loadLAZFile(file);
+      }
+      return loadLASFile(file);
+    }
+
     // Tiling with Points
     let tilesPoints = [];
     const state = { tileSize: initialSize, tilesX: 3, tilesZ: 3, scrollSpeed: 3 };
@@ -971,7 +1057,7 @@
         'Heightmap': 'heightmap',
         'Free Elevation API': 'elevation',
         'PLY File': 'ply',
-        'LAS File': 'las',
+        'LAS/LAZ File': 'las',
       }
     }).on('change', (ev) => {
       pointCloudMode = ev.value;
@@ -1059,14 +1145,14 @@
     });
 
     // LAS file loader
-    const lasFolder = sourceFolder.addFolder({ title: 'LAS File (LiDAR)', expanded: false });
+    const lasFolder = sourceFolder.addFolder({ title: 'LAS/LAZ File (LiDAR)', expanded: false });
     const lasFileInput = document.createElement('input');
     lasFileInput.type = 'file';
-    lasFileInput.accept = '.las';
+    lasFileInput.accept = '.las,.laz';
     lasFileInput.style.display = 'none';
     document.body.appendChild(lasFileInput);
 
-    lasFolder.addButton({ title: 'Load LAS File...' }).on('click', () => {
+    lasFolder.addButton({ title: 'Load LAS/LAZ File...' }).on('click', () => {
       lasFileInput.click();
     });
 
@@ -1075,17 +1161,17 @@
       if (!file) return;
 
       try {
-        const geometry = await loadLASFile(file);
+        const geometry = await loadLidarFile(file);
         disposePointCloud();
         for (const p of tilesPoints) p.visible = false;
         extractedPointCloud = new THREE.Points(geometry, loadedPointMaterial);
         extractedPointCloud.frustumCulled = false;
         scene.add(extractedPointCloud);
 
-        console.log('LAS loaded:', geometry.getAttribute('position').count, 'points');
+        console.log('LAS/LAZ loaded:', geometry.getAttribute('position').count, 'points');
       } catch (err) {
-        console.error('Failed to load LAS file:', err);
-        alert('Erreur LAS: ' + err.message + '\n\nNote: Seuls les fichiers LAS non compressés sont supportés. Pour les fichiers LAZ (compressés), utilisez un outil comme PDAL ou CloudCompare pour les convertir en LAS.');
+        console.error('Failed to load LAS/LAZ file:', err);
+        alert('Erreur LAS/LAZ: ' + err.message);
       }
     });
 
@@ -1559,10 +1645,10 @@
         return;
       }
 
-      // Handle LAS files
-      if (fileName.endsWith('.las')) {
+      // Handle LAS/LAZ files
+      if (fileName.endsWith('.las') || fileName.endsWith('.laz')) {
         try {
-          const geometry = await loadLASFile(file);
+          const geometry = await loadLidarFile(file);
           disposePointCloud();
           for (const p of tilesPoints) p.visible = false;
           extractedPointCloud = new THREE.Points(geometry, loadedPointMaterial);
@@ -1574,10 +1660,10 @@
           pane.refresh();
           updateSourceVisibility();
 
-          console.log('LAS loaded via drop:', geometry.getAttribute('position').count, 'points');
+          console.log('LAS/LAZ loaded via drop:', geometry.getAttribute('position').count, 'points');
         } catch (err) {
-          console.error('Failed to load LAS file:', err);
-          alert('Erreur LAS: ' + err.message + '\n\nNote: Seuls les fichiers LAS non compressés sont supportés.');
+          console.error('Failed to load LAS/LAZ file:', err);
+          alert('Erreur LAS/LAZ: ' + err.message);
         }
         return;
       }
@@ -1664,5 +1750,3 @@
   </script>
 </body>
 </html>
-
-
