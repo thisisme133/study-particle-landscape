@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Three.js Heightmap Pointcloud (Masked)</title>
+  <title>Three.js Point Cloud Viewer - Heightmaps, Google 3D Tiles & PLY</title>
   <style>
     html, body { margin: 0; height: 100%; background: #0e0f13; color: #e6e6e6; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji"; }
     #overlayInfo {
@@ -36,7 +36,7 @@
   </style>
 </head>
 <body>
-  <div id="overlayInfo">Drag a heightmap onto the canvas to replace. Project by <a href="https://x.com/taylor_sntx" target="_blank" rel="noopener">Taylor</a></div>
+  <div id="overlayInfo">Drag a heightmap or PLY file onto the canvas. Supports Google 3D Tiles for real-world locations. Project by <a href="https://x.com/taylor_sntx" target="_blank" rel="noopener">Taylor</a></div>
   <input id="heightmapFile" type="file" accept="image/png,image/jpeg,image/webp" style="display:none;">
 
   <script type="importmap">
@@ -44,13 +44,18 @@
       "imports": {
         "three": "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
         "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/",
-        "tweakpane": "https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.js"
+        "tweakpane": "https://cdn.jsdelivr.net/npm/tweakpane@4.0.5/dist/tweakpane.js",
+        "3d-tiles-renderer": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.4.19/src/index.js",
+        "3d-tiles-renderer/plugins": "https://cdn.jsdelivr.net/npm/3d-tiles-renderer@0.4.19/src/plugins/index.js"
       }
     }
   </script>
   <script type="module">
     import * as THREE from 'three';
     import { Pane } from 'tweakpane';
+    import { TilesRenderer, GlobeControls, EnvironmentControls } from '3d-tiles-renderer';
+    import { GoogleCloudAuthPlugin, GLTFExtensionsPlugin, TileCompressionPlugin, UpdateOnChangePlugin, UnloadTilesPlugin } from '3d-tiles-renderer/plugins';
+
     const DEFAULT_HEIGHTMAP_URL = 'assets/heightmap_512x512.png';
     // Track mouse for hover effects
     window.__mouseNdc = new THREE.Vector2(-2, -2);
@@ -502,6 +507,301 @@
     // Initialize airplane
     initAirplane();
 
+    // ========== GOOGLE 3D TILES / POINT CLOUD ==========
+    let tilesRenderer = null;
+    let tilesGroup = null;
+    let pointCloudMode = 'heightmap'; // 'heightmap' | 'google3d' | 'ply'
+    let extractedPointCloud = null;
+
+    const tiles3DState = {
+      enabled: false,
+      apiKey: '',
+      latitude: 48.8584,  // Paris - Eiffel Tower
+      longitude: 2.2945,
+      altitude: 300,
+      pointDensity: 1.0,  // 1.0 = use all vertices, 0.1 = use 10%
+      sceneScale: 0.001,  // Scale factor from meters to scene units
+      showMesh: false,    // Show original mesh alongside point cloud
+    };
+
+    // Preset locations for quick testing
+    const presetLocations = {
+      'Paris - Tour Eiffel': { lat: 48.8584, lon: 2.2945, alt: 300 },
+      'New York - Manhattan': { lat: 40.7484, lon: -73.9857, alt: 400 },
+      'San Francisco': { lat: 37.7749, lon: -122.4194, alt: 300 },
+      'Tokyo - Shibuya': { lat: 35.6595, lon: 139.7004, alt: 250 },
+      'London - Big Ben': { lat: 51.5007, lon: -0.1246, alt: 200 },
+      'Sydney Opera House': { lat: -33.8568, lon: 151.2153, alt: 200 },
+      'Dubai - Burj Khalifa': { lat: 25.1972, lon: 55.2744, alt: 500 },
+    };
+
+    // WGS84 ellipsoid parameters
+    const WGS84_A = 6378137.0;  // semi-major axis
+    const WGS84_B = 6356752.314245;  // semi-minor axis
+
+    // Convert lat/lon/alt to ECEF (Earth-Centered, Earth-Fixed)
+    function latLonToECEF(lat, lon, alt) {
+      const latRad = lat * Math.PI / 180;
+      const lonRad = lon * Math.PI / 180;
+      const e2 = 1 - (WGS84_B * WGS84_B) / (WGS84_A * WGS84_A);
+      const N = WGS84_A / Math.sqrt(1 - e2 * Math.sin(latRad) * Math.sin(latRad));
+      const x = (N + alt) * Math.cos(latRad) * Math.cos(lonRad);
+      const y = (N + alt) * Math.cos(latRad) * Math.sin(lonRad);
+      const z = (N * (1 - e2) + alt) * Math.sin(latRad);
+      return new THREE.Vector3(x, y, z);
+    }
+
+    // Get the ENU (East-North-Up) rotation matrix for a lat/lon position
+    function getENURotation(lat, lon) {
+      const latRad = lat * Math.PI / 180;
+      const lonRad = lon * Math.PI / 180;
+      // Create rotation matrix for ENU coordinate system
+      const m = new THREE.Matrix4();
+      m.set(
+        -Math.sin(lonRad), -Math.sin(latRad) * Math.cos(lonRad), Math.cos(latRad) * Math.cos(lonRad), 0,
+        Math.cos(lonRad), -Math.sin(latRad) * Math.sin(lonRad), Math.cos(latRad) * Math.sin(lonRad), 0,
+        0, Math.cos(latRad), Math.sin(latRad), 0,
+        0, 0, 0, 1
+      );
+      return m;
+    }
+
+    async function initGoogleTiles() {
+      if (!tiles3DState.apiKey) {
+        console.warn('Google 3D Tiles: API key required');
+        return;
+      }
+
+      // Clean up existing tiles
+      if (tilesRenderer) {
+        tilesRenderer.dispose();
+        tilesRenderer = null;
+      }
+      if (tilesGroup) {
+        scene.remove(tilesGroup);
+        tilesGroup = null;
+      }
+
+      try {
+        tilesGroup = new THREE.Group();
+        scene.add(tilesGroup);
+
+        tilesRenderer = new TilesRenderer();
+
+        // Register plugins
+        tilesRenderer.registerPlugin(new GoogleCloudAuthPlugin({
+          apiToken: tiles3DState.apiKey,
+          autoRefreshToken: true
+        }));
+        tilesRenderer.registerPlugin(new GLTFExtensionsPlugin());
+        tilesRenderer.registerPlugin(new TileCompressionPlugin());
+        tilesRenderer.registerPlugin(new UpdateOnChangePlugin());
+
+        // Configure renderer
+        tilesRenderer.setCamera(camera);
+        tilesRenderer.setResolutionFromRenderer(camera, renderer);
+
+        // Add to scene group
+        tilesGroup.add(tilesRenderer.group);
+
+        // Position camera based on lat/lon
+        updateTilesPosition();
+
+        console.log('Google 3D Tiles initialized');
+        tiles3DState.enabled = true;
+
+      } catch (err) {
+        console.error('Failed to initialize Google 3D Tiles:', err);
+        tiles3DState.enabled = false;
+      }
+    }
+
+    function updateTilesPosition() {
+      if (!tilesRenderer || !tilesGroup) return;
+
+      const ecefPos = latLonToECEF(tiles3DState.latitude, tiles3DState.longitude, tiles3DState.altitude);
+      const enuRotation = getENURotation(tiles3DState.latitude, tiles3DState.longitude);
+
+      // Scale and position the tiles group
+      const scale = tiles3DState.sceneScale;
+      tilesGroup.scale.set(scale, scale, scale);
+
+      // Calculate the offset so the target location is at origin
+      tilesGroup.position.set(
+        -ecefPos.x * scale,
+        -ecefPos.z * scale,  // Swap Y/Z for Three.js coordinate system
+        -ecefPos.y * scale
+      );
+
+      // Apply ENU rotation so "up" is correct
+      tilesGroup.setRotationFromMatrix(enuRotation);
+    }
+
+    // Extract point cloud from loaded 3D Tiles meshes
+    function extractPointCloudFromTiles() {
+      if (!tilesRenderer) return null;
+
+      const positions = [];
+      const colors = [];
+      const density = tiles3DState.pointDensity;
+
+      // Traverse all loaded tiles and extract vertices
+      tilesRenderer.group.traverse((child) => {
+        if (child.isMesh && child.geometry) {
+          const geo = child.geometry;
+          const posAttr = geo.getAttribute('position');
+          const colorAttr = geo.getAttribute('color');
+          const normalAttr = geo.getAttribute('normal');
+
+          if (!posAttr) return;
+
+          // Get world matrix for this mesh
+          const worldMatrix = child.matrixWorld;
+          const tempVec = new THREE.Vector3();
+          const tempColor = new THREE.Color();
+
+          // Sample vertices based on density
+          const step = Math.max(1, Math.floor(1 / density));
+          for (let i = 0; i < posAttr.count; i += step) {
+            // Get position in world space
+            tempVec.fromBufferAttribute(posAttr, i);
+            tempVec.applyMatrix4(worldMatrix);
+
+            // Apply scene scale
+            tempVec.multiplyScalar(tiles3DState.sceneScale);
+
+            positions.push(tempVec.x, tempVec.y, tempVec.z);
+
+            // Get color if available, otherwise use white
+            if (colorAttr) {
+              tempColor.fromBufferAttribute(colorAttr, i);
+              colors.push(tempColor.r, tempColor.g, tempColor.b);
+            } else {
+              colors.push(1, 1, 1);
+            }
+          }
+        }
+      });
+
+      if (positions.length === 0) return null;
+
+      // Create point cloud geometry
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      geometry.computeBoundingSphere();
+
+      return geometry;
+    }
+
+    // Create point cloud material for extracted tiles
+    const tilesPointMaterial = new THREE.PointsMaterial({
+      size: 0.02,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.9,
+      sizeAttenuation: true,
+    });
+
+    function updateExtractedPointCloud() {
+      if (extractedPointCloud) {
+        scene.remove(extractedPointCloud);
+        if (extractedPointCloud.geometry) extractedPointCloud.geometry.dispose();
+        extractedPointCloud = null;
+      }
+
+      if (!tiles3DState.enabled || !tilesRenderer) return;
+
+      const geometry = extractPointCloudFromTiles();
+      if (geometry) {
+        extractedPointCloud = new THREE.Points(geometry, tilesPointMaterial);
+        extractedPointCloud.frustumCulled = false;
+        scene.add(extractedPointCloud);
+        console.log('Point cloud extracted:', geometry.getAttribute('position').count, 'points');
+      }
+    }
+
+    function disposeTiles() {
+      if (extractedPointCloud) {
+        scene.remove(extractedPointCloud);
+        if (extractedPointCloud.geometry) extractedPointCloud.geometry.dispose();
+        extractedPointCloud = null;
+      }
+      if (tilesRenderer) {
+        tilesRenderer.dispose();
+        tilesRenderer = null;
+      }
+      if (tilesGroup) {
+        scene.remove(tilesGroup);
+        tilesGroup = null;
+      }
+      tiles3DState.enabled = false;
+    }
+
+    // ========== PLY POINT CLOUD LOADER ==========
+    async function loadPLYFile(file) {
+      const text = await file.text();
+      const lines = text.split('\n');
+
+      let headerEnd = 0;
+      let vertexCount = 0;
+      let hasColor = false;
+
+      // Parse header
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line === 'end_header') {
+          headerEnd = i + 1;
+          break;
+        }
+        if (line.startsWith('element vertex')) {
+          vertexCount = parseInt(line.split(' ')[2]);
+        }
+        if (line.startsWith('property') && (line.includes('red') || line.includes('r '))) {
+          hasColor = true;
+        }
+      }
+
+      const positions = [];
+      const colors = [];
+
+      // Parse vertices
+      for (let i = 0; i < vertexCount && (headerEnd + i) < lines.length; i++) {
+        const line = lines[headerEnd + i].trim();
+        if (!line) continue;
+
+        const parts = line.split(/\s+/);
+        if (parts.length >= 3) {
+          positions.push(parseFloat(parts[0]), parseFloat(parts[1]), parseFloat(parts[2]));
+
+          if (hasColor && parts.length >= 6) {
+            colors.push(parseFloat(parts[3]) / 255, parseFloat(parts[4]) / 255, parseFloat(parts[5]) / 255);
+          } else {
+            colors.push(0.8, 0.8, 0.8);
+          }
+        }
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+      geometry.computeBoundingSphere();
+      geometry.computeBoundingBox();
+
+      // Center and scale the point cloud
+      const center = new THREE.Vector3();
+      geometry.boundingBox.getCenter(center);
+      geometry.translate(-center.x, -center.y, -center.z);
+
+      // Scale to fit in scene
+      const size = geometry.boundingBox.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+      const scale = 10 / maxDim;  // Fit in ~10 unit box
+      geometry.scale(scale, scale, scale);
+
+      return geometry;
+    }
+
     // Tiling with Points
     let tilesPoints = [];
     const state = { tileSize: initialSize, tilesX: 3, tilesZ: 3, scrollSpeed: 3 };
@@ -649,6 +949,147 @@
         scene.fog = null;
       }
     }
+
+    // Point Cloud Source folder
+    const sourceFolder = pane.addFolder({ title: 'Point Cloud Source', expanded: true });
+    const sourceParams = {
+      mode: 'heightmap',
+      presetLocation: 'Paris - Tour Eiffel',
+    };
+
+    sourceFolder.addBinding(sourceParams, 'mode', {
+      label: 'Source',
+      options: {
+        'Heightmap': 'heightmap',
+        'Google 3D Tiles': 'google3d',
+        'PLY File': 'ply',
+      }
+    }).on('change', (ev) => {
+      pointCloudMode = ev.value;
+      updateSourceVisibility();
+    });
+
+    // Google 3D Tiles subfolder
+    const google3DFolder = sourceFolder.addFolder({ title: 'Google 3D Tiles', expanded: true });
+
+    google3DFolder.addBinding(tiles3DState, 'apiKey', { label: 'API Key' });
+
+    google3DFolder.addBinding(sourceParams, 'presetLocation', {
+      label: 'Preset',
+      options: Object.fromEntries(Object.keys(presetLocations).map(k => [k, k]))
+    }).on('change', (ev) => {
+      const loc = presetLocations[ev.value];
+      if (loc) {
+        tiles3DState.latitude = loc.lat;
+        tiles3DState.longitude = loc.lon;
+        tiles3DState.altitude = loc.alt;
+        pane.refresh();
+        if (tiles3DState.enabled) updateTilesPosition();
+      }
+    });
+
+    google3DFolder.addBinding(tiles3DState, 'latitude', { label: 'Latitude', min: -90, max: 90, step: 0.0001 }).on('change', () => {
+      if (tiles3DState.enabled) updateTilesPosition();
+    });
+    google3DFolder.addBinding(tiles3DState, 'longitude', { label: 'Longitude', min: -180, max: 180, step: 0.0001 }).on('change', () => {
+      if (tiles3DState.enabled) updateTilesPosition();
+    });
+    google3DFolder.addBinding(tiles3DState, 'altitude', { label: 'Altitude (m)', min: 50, max: 2000, step: 10 }).on('change', () => {
+      if (tiles3DState.enabled) updateTilesPosition();
+    });
+
+    google3DFolder.addBlade({ view: 'separator' });
+
+    google3DFolder.addBinding(tiles3DState, 'pointDensity', { label: 'Point Density', min: 0.01, max: 1, step: 0.01 });
+    google3DFolder.addBinding(tiles3DState, 'sceneScale', { label: 'Scene Scale', min: 0.0001, max: 0.01, step: 0.0001 });
+    google3DFolder.addBinding(tiles3DState, 'showMesh', { label: 'Show Mesh' }).on('change', (ev) => {
+      if (tilesGroup) tilesGroup.visible = ev.value;
+    });
+
+    google3DFolder.addBlade({ view: 'separator' });
+
+    google3DFolder.addButton({ title: 'Load Google 3D Tiles' }).on('click', async () => {
+      if (!tiles3DState.apiKey) {
+        alert('Please enter a Google Maps API key first.\n\nGet one at: https://console.cloud.google.com/apis/library/tile.googleapis.com');
+        return;
+      }
+      // Hide heightmap tiles
+      for (const p of tilesPoints) p.visible = false;
+      await initGoogleTiles();
+    });
+
+    google3DFolder.addButton({ title: 'Extract Point Cloud' }).on('click', () => {
+      updateExtractedPointCloud();
+    });
+
+    google3DFolder.addButton({ title: 'Disable & Clear' }).on('click', () => {
+      disposeTiles();
+      // Show heightmap tiles again
+      for (const p of tilesPoints) p.visible = true;
+    });
+
+    // PLY file loader
+    const plyFolder = sourceFolder.addFolder({ title: 'PLY File', expanded: false });
+    const plyFileInput = document.createElement('input');
+    plyFileInput.type = 'file';
+    plyFileInput.accept = '.ply';
+    plyFileInput.style.display = 'none';
+    document.body.appendChild(plyFileInput);
+
+    plyFolder.addButton({ title: 'Load PLY File...' }).on('click', () => {
+      plyFileInput.click();
+    });
+
+    plyFileInput.addEventListener('change', async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+
+      try {
+        const geometry = await loadPLYFile(file);
+
+        // Clear existing point cloud
+        if (extractedPointCloud) {
+          scene.remove(extractedPointCloud);
+          if (extractedPointCloud.geometry) extractedPointCloud.geometry.dispose();
+        }
+
+        // Hide heightmap tiles
+        for (const p of tilesPoints) p.visible = false;
+
+        // Create point cloud from PLY
+        extractedPointCloud = new THREE.Points(geometry, tilesPointMaterial);
+        extractedPointCloud.frustumCulled = false;
+        scene.add(extractedPointCloud);
+
+        console.log('PLY loaded:', geometry.getAttribute('position').count, 'points');
+      } catch (err) {
+        console.error('Failed to load PLY file:', err);
+        alert('Failed to load PLY file: ' + err.message);
+      }
+    });
+
+    function updateSourceVisibility() {
+      google3DFolder.hidden = pointCloudMode !== 'google3d';
+      plyFolder.hidden = pointCloudMode !== 'ply';
+
+      if (pointCloudMode === 'heightmap') {
+        // Show heightmap tiles, hide extracted point cloud
+        for (const p of tilesPoints) p.visible = true;
+        if (extractedPointCloud) extractedPointCloud.visible = false;
+        disposeTiles();
+      } else if (pointCloudMode === 'google3d') {
+        // Will show when loaded
+      } else if (pointCloudMode === 'ply') {
+        // PLY mode - hide heightmap
+        for (const p of tilesPoints) p.visible = false;
+        if (extractedPointCloud) extractedPointCloud.visible = true;
+      }
+    }
+
+    // Initialize visibility
+    updateSourceVisibility();
+
+    sourceFolder.addBlade({ view: 'separator' });
 
     // Heightmap folder
     const heightmapFolder = pane.addFolder({ title: 'Heightmap', expanded: true });
@@ -1069,11 +1510,54 @@
       }
     });
 
-    function handleDropFile(file) {
-      if (!file || !file.type.startsWith('image/')) return;
-      createTextureFromFile(file)
-        .then(applyHeightmapTexture)
-        .catch((err) => console.error('Failed to load dropped heightmap', err));
+    async function handleDropFile(file) {
+      if (!file) return;
+
+      // Handle PLY files
+      if (file.name.toLowerCase().endsWith('.ply')) {
+        try {
+          const geometry = await loadPLYFile(file);
+
+          // Clear existing point cloud
+          if (extractedPointCloud) {
+            scene.remove(extractedPointCloud);
+            if (extractedPointCloud.geometry) extractedPointCloud.geometry.dispose();
+          }
+
+          // Hide heightmap tiles
+          for (const p of tilesPoints) p.visible = false;
+
+          // Create point cloud from PLY
+          extractedPointCloud = new THREE.Points(geometry, tilesPointMaterial);
+          extractedPointCloud.frustumCulled = false;
+          scene.add(extractedPointCloud);
+
+          // Update mode selection
+          pointCloudMode = 'ply';
+          sourceParams.mode = 'ply';
+          pane.refresh();
+          updateSourceVisibility();
+
+          console.log('PLY loaded via drop:', geometry.getAttribute('position').count, 'points');
+        } catch (err) {
+          console.error('Failed to load PLY file:', err);
+        }
+        return;
+      }
+
+      // Handle image files (heightmaps)
+      if (!file.type.startsWith('image/')) return;
+      try {
+        const texture = await createTextureFromFile(file);
+        await applyHeightmapTexture(texture);
+        // Switch back to heightmap mode
+        pointCloudMode = 'heightmap';
+        sourceParams.mode = 'heightmap';
+        pane.refresh();
+        updateSourceVisibility();
+      } catch (err) {
+        console.error('Failed to load dropped heightmap', err);
+      }
     }
 
     renderer.domElement.addEventListener('dragover', (e) => {
@@ -1137,6 +1621,10 @@
         pointMaterial.uniforms.uAirplanePos.value.copy(airplaneGroup.position);
       } else {
         pointMaterial.uniforms.uAirplanePos.value.set(9999, 9999, 9999);
+      }
+      // Update 3D Tiles renderer
+      if (tilesRenderer && tiles3DState.enabled) {
+        tilesRenderer.update();
       }
       renderer.render(scene, camera);
     }
